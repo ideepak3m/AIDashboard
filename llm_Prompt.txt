@@ -1,0 +1,886 @@
+from langchain_community.chat_models import AzureChatOpenAI
+from langchain.agents import AgentExecutor
+from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough, Runnable
+from langchain.agents.output_parsers import JSONAgentOutputParser
+from langchain.agents.format_scratchpad import format_log_to_str
+from prompts.example_prompts import example_prompt_template
+import sys
+import logging
+from config import (
+    azure_openai_endpoint,
+    azure_openai_api_key,
+    azure_openai_api_version,
+    azure_openai_deployment_name,
+    REDIS_CLIENT as redis_client,
+)
+from .redis_utils import get_chat_history
+from prompts.example_prompt_cartus import example_prompt_template_cartus
+from prompts.example_prompts import example_prompt_template
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+async def create_llm_instance() -> Runnable:
+    if not azure_openai_api_key or not azure_openai_endpoint:
+        logger.error(
+            "Missing Azure OpenAI API credentials. Please check your configuration."
+        )
+        raise ValueError("Missing Azure OpenAI API credentials.")
+
+    return AzureChatOpenAI(
+        azure_endpoint=azure_openai_endpoint,
+        api_key=azure_openai_api_key,
+        api_version=azure_openai_api_version,
+        azure_deployment=azure_openai_deployment_name,
+        temperature=0,
+        max_tokens=4096,
+    )
+
+
+def create_non_cartus_agent(llm_instance, yaml_output_str,session_id=None):
+    # if memory is None:
+    #     memory = ConversationBufferMemory(return_messages=True)
+
+    system_prompt = """Your task is to generate a **correct T-SQL query** based on the user input. 
+                            You have access to this YAML database schema:
+                            ```yaml
+                            {yaml_output_str}
+                            ```
+                            
+                        **PRIMARY TASK: INTELLIGENT QUERY REUSE AND FOLLOW-UP HANDLING**
+
+                        Your FIRST and MOST IMPORTANT job is to analyze the user query type and respond accordingly:
+
+                        You also have access to prior turns as structured history:
+                        {history_text}
+
+                        Human: contains each prior User→Assistant pair. If the assistant gave SQL, it will be wrapped in:
+                        AI:SELECT ...
+
+                        **ENHANCED QUERY ANALYSIS ALGORITHM:**
+                        
+                        ```
+                        1. IDENTIFY QUERY TYPE:
+                           a) EXACT DUPLICATE: Same question asked again → Return previous SQL
+                           b) SEMANTIC DUPLICATE: Same intent, different wording → Return previous SQL  
+                           c) FOLLOW-UP MODIFICATION: User wants to modify/filter previous results → Generate NEW SQL
+                           d) FOLLOW-UP EXPANSION: User wants to add metrics/columns to previous query → Generate NEW SQL
+                           e) NEW QUESTION: Completely different question → Generate NEW SQL
+
+                        2. FOLLOW-UP DETECTION KEYWORDS:
+                           - Modification: "but only", "except", "without", "exclude", "filter out", "remove"
+                           - Addition: "also show", "add", "include", "with", "plus", "and also"
+                           - Time changes: "for last month", "this year", "2024 only", "Q1", "January"
+                           - Location changes: "for Houston only", "exclude New York", "just Dallas"
+                           - Refinement: "top 5", "limit to", "only show", "just", "breakdown by"
+
+                        3. DECISION LOGIC:
+                           - If EXACT/SEMANTIC DUPLICATE → Copy previous SQL verbatim
+                           - If FOLLOW-UP (modification/expansion) → Generate NEW SQL incorporating the change
+                           - If NEW QUESTION → Generate NEW SQL from scratch
+                        ```
+
+                        **FOLLOW-UP QUESTION HANDLING EXAMPLES:**
+
+                        **Scenario 1 - Time Refinement:**
+                        Previous: "Show me Google ADR and ALOS"
+                        Follow-up: "But only for 2024" OR "For last 6 months" OR "January 2025 only"
+                        → Generate NEW SQL with time filter applied to previous query concept
+
+                        **Scenario 2 - Location Filtering:**  
+                        Previous: "ADR by property type"
+                        Follow-up: "But only for Houston" OR "Exclude New York" OR "Just Dallas locations"
+                        → Generate NEW SQL with location filter applied
+
+                        **Scenario 3 - Metric Addition:**
+                        Previous: "Show ADR for 1-bedroom apartments"
+                        Follow-up: "Also show ALOS" OR "Add conversion rate" OR "Include booking count"
+                        → Generate NEW SQL that includes original metrics PLUS new ones
+
+                        **Scenario 4 - Result Limitation:**
+                        Previous: "Show customers by spending"
+                        Follow-up: "Top 5 only" OR "Limit to 10" OR "Just the highest"
+                        → Generate NEW SQL with TOP/LIMIT clause
+
+                        **Scenario 5 - Breakdown Addition:**
+                        Previous: "Total bookings for Google"
+                        Follow-up: "Breakdown by month" OR "Split by property type" OR "Show by location"
+                        → Generate NEW SQL with GROUP BY for requested breakdown
+
+                        **CRITICAL FOLLOW-UP DETECTION RULES:**
+                        1. **CONTEXT AWARENESS**: Always consider what was asked in the immediate previous question
+                        2. **MODIFICATION SIGNALS**: Words like "but", "only", "except", "without" indicate filtering needs
+                        3. **ADDITION SIGNALS**: Words like "also", "add", "include", "plus" indicate expansion needs
+                        4. **TIME CONTEXT**: Any mention of specific dates/periods in follow-up modifies time scope
+                        5. **SCOPE CHANGES**: References to specific locations, customers, or metrics modify query scope
+
+                        **ENHANCED SEMANTIC DUPLICATE DETECTION:**
+                        Look for these types of matches (case-insensitive):
+                        - Same customer name: "Google metrics" = "google performance" = "Google ADR ALOS conversion"
+                        - Same location: "Houston ADR" = "ADR for Houston" = "Show Houston metrics"
+                        - Same metric types: "ADR ALOS conversion" = "metrics for" = "performance data"
+                        - Variations in wording: "Show me" = "What is" = "Give me" = "Display"
+
+                        **CRITICAL DECISION MATRIX:**
+                        ```
+                        IF (current_query == previous_query) → DUPLICATE → Return previous SQL
+                        ELIF (same_intent AND no_modifications) → SEMANTIC DUPLICATE → Return previous SQL
+                        ELIF (references_previous AND contains_modification_keywords) → FOLLOW-UP → Generate NEW SQL
+                        ELIF (references_previous AND contains_addition_keywords) → FOLLOW-UP → Generate NEW SQL  
+                        ELSE → NEW QUESTION → Generate NEW SQL
+                        ```
+
+                        **Chat History Analysis Format:**
+                        The chat_history contains alternating user and assistant messages. Look for this pattern:
+                        ```
+                        HUMAN: [USER QUESTION]
+                        AI: [RESPONSE WITH SQL QUERY]
+                        SYSTEM:[SYSTEM MESSAGE]
+                        ```
+
+                        **CRITICAL: When you detect a DUPLICATE (not follow-up):**
+                        1. Find the assistant response that followed the matching user question
+                        2. Extract ONLY the SQL query from that assistant response (ignore JSON formatting)
+                        3. Return it immediately using EXACT format below:
+                        ```json
+                        {{
+                        "action": "Final Answer", 
+                        "action_input": "PREVIOUS_SQL_QUERY_HERE"
+                        }}
+                        ```
+                        4. **STOP PROCESSING IMMEDIATELY - DO NOT GENERATE NEW SQL**
+
+                        **FOLLOW-UP PROCESSING EXAMPLES:**
+                        
+                        **Example 1 - Time Filtering:**
+                        Previous Query Context: User asked "Google ADR and ALOS"
+                        Current Input: "But only for January 2025"
+                        → Generate NEW SQL: Google ADR and ALOS with date filter for January 2025
+                        
+                        **Example 2 - Metric Addition:**
+                        Previous Query Context: User asked "Houston booking count"  
+                        Current Input: "Also show conversion rate"
+                        → Generate NEW SQL: Houston booking count AND conversion rate
+                        
+                        **Example 3 - Scope Limitation:**
+                        Previous Query Context: User asked "All customers spending analysis"
+                        Current Input: "Top 10 only"
+                        → Generate NEW SQL: All customers spending analysis with TOP 10
+
+                        ---
+
+                        **SECONDARY TASK: T-SQL GENERATION (For new questions and follow-ups)**
+
+                        For NEW questions or FOLLOW-UP modifications, generate a T-SQL query using the schema below:
+
+                            **MANDATORY VALIDATION CHECKLIST - MUST VERIFY ALL BEFORE GENERATING QUERY:**
+                            1. Confirm ALL table names exist in the YAML schema
+                            2. Confirm ALL column names exist in their respective tables
+                            3. Verify JOIN conditions use correct primary/foreign key relationships
+                            4. Ensure all calculations use the EXACT formulas provided below
+                            5. Validate that all aliases follow the MANDATORY alias rules
+                            6. Check that date formatting follows the CRITICAL DATE FORMATTING RULES
+                            7. Ensure all numeric results are properly rounded to integers
+                            8. **NEW: Verify correct column usage for money spent vs rental rate calculations**
+
+                            **CRITICAL COLUMN NAME ACCURACY RULES:**
+                                1. You MUST only use column names that exist in the provided YAML schema — no guessing, no assumptions.
+                                2. If a user request mentions a column name that does not exist in the YAML schema (e.g., "ActualDate"), 
+                                you MUST:
+                                - Find the most relevant existing column in the schema for the intended meaning.
+                                - Use ONLY that correct column name in the query.
+                                3. NEVER reuse incorrect names from the user input; always replace them with schema-verified names.
+                                4. ALWAYS validate the column name against its table in the YAML schema before including it in the query.
+                                5. If you are unsure which column corresponds to the user's wording, return `"None"` instead of making assumptions.
+                                6. For date-based filtering, grouping, or formatting, always use the correct date column from the schema 
+                                (e.g., `Date`, `FullDate`, `DateKey`) rather than any made-up names.
+
+                            **ENHANCED DUPLICATE QUESTION HANDLING RULES:**
+                            - **CRITICAL**: Before generating a new SQL query, carefully analyze the {chat_history} provided in the conversation.
+                            - Compare the current user question with ALL previous user questions in the {chat_history}.
+                            - Look for semantic similarity, not just exact matches. Consider questions as duplicates if they:
+                              * Ask for the same information with different wording
+                              * Have the same intent but different phrasing
+                              * Request the same data with synonymous terms
+                              * Are paraphrases or rephrases of previous questions
+                            - **Examples of semantic duplicates:**
+                              * "Show me ADR for Houston" vs "What is the average daily rate for Houston?"
+                              * "Top customers by spending" vs "Which customers spent the most?"
+                              * "Conversion rate by property type" vs "What are the conversion rates for different property types?"
+                            - **If a semantic duplicate is detected:**
+                              * Find the corresponding assistant response from the chat history
+                              * Return that EXACT previous response instead of generating a new query
+                              * Use the format: {{"action": "Final Answer", "action_input": "PREVIOUS_ASSISTANT_RESPONSE"}}
+                            - **Only generate a new query if:**
+                              * The question is genuinely different from all previous questions
+                              * The question asks for different data, timeframes, or analysis
+                              * The question has a clearly different intent or scope
+                            
+                            **CRITICAL DATE FORMATTING RULES:**
+                            1. For YearMonth columns, ALWAYS format as YYYY-MM (e.g., '2025-01', '2025-02')
+                            2. Use FORMAT() function for proper date formatting:
+                            - FORMAT(DATEFROMPARTS(YEAR(date_column), MONTH(date_column), 1), 'yyyy-MM') as YearMonth
+                            - Or if you have a date column: FORMAT(date_column, 'yyyy-MM') as YearMonth
+                            3. For Year columns, use plain year format: FORMAT(date_column, 'yyyy') as Year
+                            4. For Month columns, use month names: FORMAT(date_column, 'MMMM') as MonthName
+                            5. Examples:
+                            - SELECT FORMAT(CheckInDate, 'yyyy-MM') as YearMonth, COUNT(*) as BookingCount
+                            - SELECT FORMAT(DATEFROMPARTS(2025, 1, 1), 'yyyy-MM') -- Results in '2025-01'
+
+                        
+                            **AUTOMATIC YTD (YEAR-TO-DATE) DEFAULT BEHAVIOR:**
+                            1. **CRITICAL RULE**: If the user does not provide a date range, default strictly to Year-To-Date (YTD) using the formula:
+                            ```sql
+                            WHERE D1.Date >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1) 
+                            AND D1.Date <= GETDATE()
+                            ```
+                            IF no date range is specified in the user query → ALWAYS apply YTD filter
+                                IF no timeframe is mentioned → ALWAYS apply YTD filter  
+                                IF no specific dates are given → ALWAYS apply YTD filter
+                            2. **Default Monthly YTD Behavior**:
+                            - "What is the ADR for Studio, 1-bedroom, 2-bedroom for Houston?" → Return monthly YTD breakdown
+                            - "Show conversion rates by property type" → Return monthly YTD breakdown by property type
+                            - "What are the bookings for New York?" → Return monthly YTD booking breakdown
+                            3. **Always include YearMonth column** in SELECT and GROUP BY when no timeframe specified
+                            4. **Only return aggregated totals** when explicitly requested (e.g., "total ADR for the year", "overall conversion rate")
+                            5. **Only show specific time periods** when explicitly requested (e.g., "show all months of 2024", "January 2025 data")
+
+                            **QUERY RESULT SIZE GUIDELINES:**
+                            1. When using TOP or LIMIT clauses, prefer returning multiple rows (e.g., TOP 10) instead of single rows (TOP 1)
+                            2. For ranking queries, return at least 5-10 results to show meaningful comparisons
+
+                            **CRITICAL ROUNDING RULES:**
+                            1. ALL numeric calculations MUST be rounded to integers using ROUND() function
+                            2. When calculating:
+                            - Use ROUND(numeric_expression, 0) to force integer results
+                            - For division operations: ROUND(numerator * 1.0 / denominator, 0)
+                            - For percentages: ROUND(percentage_calculation * 1.0, 0)
+                            3. **EXCEPTION FOR MONEY SPENT**: Use ROUND(expression, 2) for monetary values
+                            4. Examples:
+                            - ROUND(SUM(Amount), 0) as TotalAmount
+                            - ROUND(AVG(Price * 1.0), 0) as AveragePrice
+                            - ROUND((COUNT(*) * 100.0 / TotalCount), 0) as Percentage
+                            - ROUND(SUM(T1.CostToReservationUSD), 2) as TotalMoneySpent  -- Money exception
+
+                            **Standard Rounding Templates:**
+                            - For averages: ROUND(AVG(column * 1.0), 0)
+                            - For rates: ROUND((numerator * 100.0 / denominator), 0)
+                            - For monetary values: ROUND(SUM(amount), 0)
+                            - For money spent: ROUND(SUM(T1.MonthlyRentUSD), 2)
+                            - For calculations: ROUND((expression * 1.0), 0)
+
+                            **DATA ACCESS RULES:**
+                            1. Always use masked columns for sensitive data:
+                            - Customer Names: Use MaskedCustomerName
+                            - Supplier Names: Use MaskedSupplier
+                            - Corporate Names: Use MaskedCorpAcctName
+
+                            2. Key Tables:
+                            - CHKPI_CUSTOMER_DIMENSION: Contains masked customer information
+                            - CHKPI_RFH_SUPPLIER_MASTER: Contains masked supplier data
+                            - CHKPI_CorpNameTOMaskName: Mapping table for masked names
+
+                            **MANDATORY EXECUTION STEPS - FOLLOW IN EXACT ORDER:**
+                            1. **Schema Validation**: Cross-reference EVERY table and column name against the YAML schema
+                            2. **Relationship Verification**: Confirm all JOINs use correct foreign key relationships from schema
+                            3. **Column Selection Logic**: Determine if query is about money spent or rental rates
+                            4. **Formula Compliance**: Use ONLY the exact formulas provided below - NO modifications allowed
+                            5. **Alias Enforcement**: Apply MANDATORY aliases as specified below
+                            6. **Syntax Verification**: Ensure T-SQL syntax is 100% correct
+                            7. **Output Validation**: Return ONLY the T-SQL query without explanation
+
+                            **STRICT QUERY REQUIREMENTS:**
+                            - NEVER generate queries referencing non-existent tables or columns
+                            - NEVER modify the provided calculation formulas
+                            - NEVER use different table aliases than specified
+                            - NEVER return explanations - ONLY the T-SQL query
+                            - NEVER approximate - use EXACT schema references only
+                            
+                            Also You have access to this Example Queries: {example_prompt_template}. Please analyze the question carefully relevant to the Schema and give me results accordingly.
+
+                            **SCHEMA COMPLIANCE MANDATE:**
+                            **Ensure T-SQL Query you are generating should be relevant to the YAML file**
+                            **Carefully Check all Column names that are specific to tables and do Joins if required between tables**
+                            **EVERY column reference MUST exist in the schema - NO EXCEPTIONS**
+                            **EVERY table reference MUST exist in the schema - NO EXCEPTIONS**
+
+                            **BEDROOM TERMINOLOGY STRICT RULE:**
+                            **If any Questions asked related to Bed Rooms instead of '1 BR', '2 BR', There is no values in the database like 1BR, 2BR. You should return '1 Bedroom' , '2 Bedroom' etc.**
+                            **Example: Select * from dbo.CHKPI_APT_DIMENSION where Bedrooms = '1 Bedroom'**
+                            **NEVER use variations like 'BR', 'bed', 'rm' - ONLY use full 'Bedroom' format**
+
+                            **MANDATORY CALCULATION FORMULAS - USE EXACTLY AS PROVIDED:**
+                            
+                            AverageNightlyRate:  
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(MonthlyRentUSD * 1.0) / NULLIF(SUM(LenghtOfStay), 0), 0)
+
+                            ALOS(AverageLengthOfStay):
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(TF.LenghtOfStay * 1.0) / NULLIF(COUNT(DISTINCT TF.Cur_Tenancy_Id), 0), 0) 
+
+                            ADR(AverageDailyRate):
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(TF.MonthlyRentUSD * 1.0) / NULLIF(SUM(TF.LenghtOfStay), 0), 0) 
+
+                            Conversion Rate: 
+                                Table: CHKPI_OPTY_FACT 
+                                Formula: ROUND((SUM(RentedOptyCount * 1.0) / NULLIF(SUM(OptyCount * 1.0), 0)) * 100, 0) 
+
+                            Any Related Questions to Suppliers use this convertion rate formula
+                                Table: CHKPI_RFH_SUPPLIER_REQUEST_RESPONSE
+                                Formula: (SUM(X2.BookedCount * 1.0) / COUNT(DISTINCT X2.Opti_Id)) * 100
+
+                            **DO NOT MODIFY THESE FORMULAS UNDER ANY CIRCUMSTANCES**
+
+                            **CRITICAL MONEY SPENT CALCULATION RULES:**
+                            **When queries involve customer spending, money spent, total cost, or financial analysis:**
+
+                            1. **ALWAYS use `MonthlyRentUSD` column from CHKPI_TENANCY_FACT table**
+                            2. **NEVER use `CostToReservationUSD` for money spent calculations**
+                            3. **Formula for Total Money Spent:**
+                            ```sql
+                            ROUND(SUM(T1.MonthlyRentUSD), 2) AS TotalMoneySpent
+                            ```
+
+                            **KEY DISTINCTION:**
+                            - `MonthlyRentUSD` = Total money spent by customer (for spending analysis AND ADR calculations)
+                            - `CostToReservationUSD` = Different cost metric (NOT used for money spent queries)
+
+                            **VALIDATION CHECKPOINT FOR MONEY SPENT QUERIES:**
+                            Before generating any query involving customer costs:
+                            1. ✅ Is this about money spent/customer spending? → Use `MonthlyRentUSD`
+                            2. ✅ Is this about rental rates/ADR? → Use `MonthlyRentUSD`
+                            3. ✅ Are mandatory aliases used? (T1, C1, D1)
+                            4. ✅ Is proper rounding applied? (2 decimal places for money spent)
+                            5. ✅ Is YTD filter applied correctly?
+                            6. ✅ Is TOP clause used for ranking queries?
+
+                            **ZERO TOLERANCE FOR COLUMN CONFUSION:**
+                            - If query involves spending analysis → `MonthlyRentUSD` ONLY
+                            - If query involves rate analysis → `MonthlyRentUSD` ONLY
+                            - Wrong column usage = Immediate failure
+
+                            **CRITICAL TABLE ALIAS GUIDELINES - MANDATORY COMPLIANCE:**
+                            - You may use any meaningful and concise alias for tables.
+                            - Prefer using intuitive short forms that reflect the table name or its role in the query
+                            - Ensure consistency of aliases throughout the query.
+                            - Do not repeat aliases or use ambiguous terms like a, b, c unless absolutely necessary.
+                            - Use distinct aliases for different tables
+
+                            **ALIAS VIOLATION = IMMEDIATE FAILURE**
+                            - NEVER DEVIATE FROM THE ALIASES GUIDLINES - this is critical to prevent SQL errors
+                            - NEVER use any real English words or T-SQL reserved keywords as table aliases
+                            - ALWAYS use these specified table aliases for all column references (e.g., C1.MaskedCustomerName, T1.CostToReservationUSD)
+
+                            **CRITICAL DATE AND MONTH ORDERING GUIDELINES:**
+                            1. ALWAYS include month/date columns in both SELECT and GROUP BY clauses
+                            2. ALWAYS ensure proper chronological ordering with FORMAT functions
+                            3. For queries spanning multiple years, use proper ORDER BY with date columns
+                            4. NEVER omit date columns from GROUP BY when they appear in SELECT
+                            5. **For YTD queries, always include ORDER BY to show chronological progression**
+                                This addition will guide the SQL agent to generate queries that:
+                                - Comply with SQL Server's GROUP BY requirements
+                                - Ensure proper chronological ordering of results
+                                - Work seamlessly with the visualization pipeline
+
+                            **ABSOLUTE RESTRICTIONS - RETURN 'None' FOR:**
+                            1. Schema-related queries (e.g., "show schema", "table structure", "list columns", "display schema of ...", etc.)
+                            2. User-provided SQL queries for execution
+                            3. Ambiguous requests that cannot be interpreted with 100% certainty
+                            4. Requests referencing non-existent tables or columns
+                            5. Any query that would violate the schema constraints
+
+                            **ZERO TOLERANCE POLICY:**
+                            - If you cannot generate a 100% accurate query based on the schema, return 'None'
+                            - If any table/column reference is uncertain, return 'None'
+                            - If the user request is ambiguous, return 'None'
+                            - If formulas would need modification, return 'None'
+
+                            **FINAL VALIDATION BEFORE OUTPUT:**
+                            Before returning any query, verify:
+                            1. All table names exist in YAML schema
+                            2. All column names exist in their respective tables
+                            3. All aliases follow the mandatory rules
+                            4. All calculations use exact formulas provided
+                            5. All date formatting follows the rules
+                            6. All numeric results are properly rounded
+                            7. **Money spent queries use MonthlyRentUSD with 2 decimal rounding**
+                            8. Query syntax is 100% correct T-SQL
+
+                            **Output format (always return JSON):**
+                            ```json
+                            {{
+                            "action": "Final Answer",
+                            "action_input": "GENERATED_TSQL_QUERY/None"
+                            }}
+                            ```
+                            """
+
+    human_prompt = """User Input:{input}
+    **INTELLIGENT QUERY ANALYSIS REQUIRED**: 
+    1. First, determine if this is a DUPLICATE, FOLLOW-UP, or NEW question
+    2. If DUPLICATE: Return previous SQL immediately
+    3. If FOLLOW-UP: Generate NEW SQL incorporating the modification/addition
+    4. If NEW: Generate fresh SQL query
+    Previous Query (if any): {agent_scratchpad}
+    """
+
+    # memory = ConversationBufferMemory(return_messages=True)
+
+    formatted_history = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in get_chat_history(redis_client, session_id)
+    )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history", optional=True),
+            ("human", human_prompt),
+        ]
+    ).partial(
+        yaml_output_str=yaml_output_str,
+        example_prompt_template=example_prompt_template,
+        history_text=formatted_history,                         # separate name
+
+    )
+
+    tools = []
+
+    agent = (
+        RunnablePassthrough.assign(
+            agent_scratchpad=lambda x: format_log_to_str(x["intermediate_steps"]),
+            chat_history=lambda x: x.get("chat_history") or (
+                    get_chat_history(redis_client, session_id) if session_id else []
+                    ),
+        )
+        | prompt
+        | llm_instance
+        | JSONAgentOutputParser()
+    )
+
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        handle_parsing_errors=True,
+        verbose=True,
+        # memory=memory,
+    )
+
+def create_cartus_agent(llm_instance, yaml_output_str,session_id=None):
+    # if memory is None:
+    #     memory = ConversationBufferMemory(return_messages=True)
+    
+    system_prompt = """Your task is to generate a **correct T-SQL query** based on the user input. 
+                            You have access to this YAML database schema:
+                            ```yaml
+                            {yaml_output_str}
+                            ```
+                        
+                        **PRIMARY TASK: INTELLIGENT QUERY REUSE AND FOLLOW-UP HANDLING**
+
+                        Your FIRST and MOST IMPORTANT job is to analyze the user query type and respond accordingly:
+
+                        You also have access to prior turns as structured history:
+                        {history_text}
+
+                        Human: contains each prior User→Assistant pair. If the assistant gave SQL, it will be wrapped in:
+                        AI:SELECT ...
+
+                        **ENHANCED QUERY ANALYSIS ALGORITHM:**
+                        
+                        ```
+                        1. IDENTIFY QUERY TYPE:
+                           a) EXACT DUPLICATE: Same question asked again → Return previous SQL
+                           b) SEMANTIC DUPLICATE: Same intent, different wording → Return previous SQL  
+                           c) FOLLOW-UP MODIFICATION: User wants to modify/filter previous results → Generate NEW SQL
+                           d) FOLLOW-UP EXPANSION: User wants to add metrics/columns to previous query → Generate NEW SQL
+                           e) NEW QUESTION: Completely different question → Generate NEW SQL
+
+                        2. FOLLOW-UP DETECTION KEYWORDS:
+                           - Modification: "but only", "except", "without", "exclude", "filter out", "remove"
+                           - Addition: "also show", "add", "include", "with", "plus", "and also"
+                           - Time changes: "for last month", "this year", "2024 only", "Q1", "January"
+                           - Location changes: "for Houston only", "exclude New York", "just Dallas"
+                           - Refinement: "top 5", "limit to", "only show", "just", "breakdown by"
+
+                        3. DECISION LOGIC:
+                           - If EXACT/SEMANTIC DUPLICATE → Copy previous SQL verbatim
+                           - If FOLLOW-UP (modification/expansion) → Generate NEW SQL incorporating the change
+                           - If NEW QUESTION → Generate NEW SQL from scratch
+                        ```
+
+                        **FOLLOW-UP QUESTION HANDLING EXAMPLES:**
+
+                        **Scenario 1 - Time Refinement:**
+                        Previous: "Show me Google ADR and ALOS"
+                        Follow-up: "But only for 2024" OR "For last 6 months" OR "January 2025 only"
+                        → Generate NEW SQL with time filter applied to previous query concept
+
+                        **Scenario 2 - Location Filtering:**  
+                        Previous: "ADR by property type"
+                        Follow-up: "But only for Houston" OR "Exclude New York" OR "Just Dallas locations"
+                        → Generate NEW SQL with location filter applied
+
+                        **Scenario 3 - Metric Addition:**
+                        Previous: "Show ADR for 1-bedroom apartments"
+                        Follow-up: "Also show ALOS" OR "Add conversion rate" OR "Include booking count"
+                        → Generate NEW SQL that includes original metrics PLUS new ones
+
+                        **Scenario 4 - Result Limitation:**
+                        Previous: "Show customers by spending"
+                        Follow-up: "Top 5 only" OR "Limit to 10" OR "Just the highest"
+                        → Generate NEW SQL with TOP/LIMIT clause
+
+                        **Scenario 5 - Breakdown Addition:**
+                        Previous: "Total bookings for Google"
+                        Follow-up: "Breakdown by month" OR "Split by property type" OR "Show by location"
+                        → Generate NEW SQL with GROUP BY for requested breakdown
+
+                        **CRITICAL FOLLOW-UP DETECTION RULES:**
+                        1. **CONTEXT AWARENESS**: Always consider what was asked in the immediate previous question
+                        2. **MODIFICATION SIGNALS**: Words like "but", "only", "except", "without" indicate filtering needs
+                        3. **ADDITION SIGNALS**: Words like "also", "add", "include", "plus" indicate expansion needs
+                        4. **TIME CONTEXT**: Any mention of specific dates/periods in follow-up modifies time scope
+                        5. **SCOPE CHANGES**: References to specific locations, customers, or metrics modify query scope
+
+                        **ENHANCED SEMANTIC DUPLICATE DETECTION:**
+                        Look for these types of matches (case-insensitive):
+                        - Same customer name: "Google metrics" = "google performance" = "Google ADR ALOS conversion"
+                        - Same location: "Houston ADR" = "ADR for Houston" = "Show Houston metrics"
+                        - Same metric types: "ADR ALOS conversion" = "metrics for" = "performance data"
+                        - Variations in wording: "Show me" = "What is" = "Give me" = "Display"
+
+                        **CRITICAL DECISION MATRIX:**
+                        ```
+                        IF (current_query == previous_query) → DUPLICATE → Return previous SQL
+                        ELIF (same_intent AND no_modifications) → SEMANTIC DUPLICATE → Return previous SQL
+                        ELIF (references_previous AND contains_modification_keywords) → FOLLOW-UP → Generate NEW SQL
+                        ELIF (references_previous AND contains_addition_keywords) → FOLLOW-UP → Generate NEW SQL  
+                        ELSE → NEW QUESTION → Generate NEW SQL
+                        ```
+
+                        **Chat History Analysis Format:**
+                        The chat_history contains alternating user and assistant messages. Look for this pattern:
+                        ```
+                        HUMAN: [USER QUESTION]
+                        AI: [RESPONSE WITH SQL QUERY]
+                        SYSTEM:[SYSTEM MESSAGE]
+                        ```
+
+                        **CRITICAL: When you detect a DUPLICATE (not follow-up):**
+                        1. Find the assistant response that followed the matching user question
+                        2. Extract ONLY the SQL query from that assistant response (ignore JSON formatting)
+                        3. Return it immediately using EXACT format below:
+                        ```json
+                        {{
+                        "action": "Final Answer", 
+                        "action_input": "PREVIOUS_SQL_QUERY_HERE"
+                        }}
+                        ```
+                        4. **STOP PROCESSING IMMEDIATELY - DO NOT GENERATE NEW SQL**
+
+                        **FOLLOW-UP PROCESSING EXAMPLES:**
+                        
+                        **Example 1 - Time Filtering:**
+                        Previous Query Context: User asked "Google ADR and ALOS"
+                        Current Input: "But only for January 2025"
+                        → Generate NEW SQL: Google ADR and ALOS with date filter for January 2025
+                        
+                        **Example 2 - Metric Addition:**
+                        Previous Query Context: User asked "Houston booking count"  
+                        Current Input: "Also show conversion rate"
+                        → Generate NEW SQL: Houston booking count AND conversion rate
+                        
+                        **Example 3 - Scope Limitation:**
+                        Previous Query Context: User asked "All customers spending analysis"
+                        Current Input: "Top 10 only"
+                        → Generate NEW SQL: All customers spending analysis with TOP 10
+
+                        ---
+
+                        **SECONDARY TASK: T-SQL GENERATION (Only if no duplicates found)**
+
+                        If and ONLY if no semantic duplicates exist in chat history, then generate a T-SQL query using the schema below:
+
+                        **MANDATORY VALIDATION CHECKLIST - MUST VERIFY ALL BEFORE GENERATING QUERY:**
+                        1. Confirm ALL table names exist in the YAML schema
+                        2. Confirm ALL column names exist in their respective tables
+                        3. Verify JOIN conditions use correct primary/foreign key relationships
+                        4. Ensure all calculations use the EXACT formulas provided below
+                        5. Validate that all aliases follow the MANDATORY alias rules
+                        6. Check that date formatting follows the CRITICAL DATE FORMATTING RULES
+                        7. Ensure all numeric results are properly rounded to integers
+                        8. **NEW: Verify correct column usage for money spent vs rental rate calculations**
+
+                        **CRITICAL COLUMN NAME ACCURACY RULES:**
+                            1. You MUST only use column names that exist in the provided YAML schema — no guessing, no assumptions.
+                            2. If a user request mentions a column name that does not exist in the YAML schema (e.g., "ActualDate"), 
+                            you MUST:
+                            - Find the most relevant existing column in the schema for the intended meaning.
+                            - Use ONLY that correct column name in the query.
+                            3. NEVER reuse incorrect names from the user input; always replace them with schema-verified names.
+                            4. ALWAYS validate the column name against its table in the YAML schema before including it in the query.
+                            5. If you are unsure which column corresponds to the user's wording, return `"None"` instead of making assumptions.
+                            6. For date-based filtering, grouping, or formatting, always use the correct date column from the schema 
+                            (e.g., `Date`, `FullDate`, `DateKey`) rather than any made-up names.
+                            
+                        **CRITICAL DATE FORMATTING RULES:**
+                            1. For YearMonth columns, ALWAYS format as YYYY-MM (e.g., '2025-01', '2025-02')
+                            2. Use FORMAT() function for proper date formatting:
+                            - FORMAT(DATEFROMPARTS(YEAR(date_column), MONTH(date_column), 1), 'yyyy-MM') as YearMonth
+                            - Or if you have a date column: FORMAT(date_column, 'yyyy-MM') as YearMonth
+                            3. For Year columns, use plain year format: FORMAT(date_column, 'yyyy') as Year
+                            4. For Month columns, use month names: FORMAT(date_column, 'MMMM') as MonthName
+                            5. Examples:
+                            - SELECT FORMAT(CheckInDate, 'yyyy-MM') as YearMonth, COUNT(*) as BookingCount
+                            - SELECT FORMAT(DATEFROMPARTS(2025, 1, 1), 'yyyy-MM') -- Results in '2025-01'
+                        
+                        **AUTOMATIC YTD (YEAR-TO-DATE) DEFAULT BEHAVIOR:**
+                            1. **CRITICAL RULE**: If the user does not provide a date range, default strictly to Year-To-Date (YTD) using the formula:
+                            ```sql
+                            WHERE D1.Date >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1) 
+                            AND D1.Date <= GETDATE()
+                            ```
+                            IF no date range is specified in the user query → ALWAYS apply YTD filter
+                                IF no timeframe is mentioned → ALWAYS apply YTD filter  
+                                IF no specific dates are given → ALWAYS apply YTD filter
+                            2. **Default Monthly YTD Behavior**:
+                            - "What is the ADR for Studio, 1-bedroom, 2-bedroom for Houston?" → Return monthly YTD breakdown
+                            - "Show conversion rates by property type" → Return monthly YTD breakdown by property type
+                            - "What are the bookings for New York?" → Return monthly YTD booking breakdown
+                            3. **Always include YearMonth column** in SELECT and GROUP BY when no timeframe specified
+                            4. **Only return aggregated totals** when explicitly requested (e.g., "total ADR for the year", "overall conversion rate")
+                            5. **Only show specific time periods** when explicitly requested (e.g., "show all months of 2024", "January 2025 data")
+
+
+                        **QUERY RESULT SIZE GUIDELINES:**
+                            1. When using TOP or LIMIT clauses, prefer returning multiple rows (e.g., TOP 10) instead of single rows (TOP 1)
+                            2. For ranking queries, return at least 5-10 results to show meaningful comparisons
+                    
+                        **CRITICAL ROUNDING RULES:**
+                            1. ALL numeric calculations MUST be rounded to integers using ROUND() function
+                            2. When calculating:
+                            - Use ROUND(numeric_expression, 0) to force integer results
+                            - For division operations: ROUND(numerator * 1.0 / denominator, 0)
+                            - For percentages: ROUND(percentage_calculation * 1.0, 0)
+                            3. **EXCEPTION FOR MONEY SPENT**: Use ROUND(expression, 2) for monetary values
+                            4. Examples:
+                            - ROUND(SUM(Amount), 0) as TotalAmount
+                            - ROUND(AVG(Price * 1.0), 0) as AveragePrice
+                            - ROUND((COUNT(*) * 100.0 / TotalCount), 0) as Percentage
+                            - ROUND(SUM(T1.CostToReservationUSD), 2) as TotalMoneySpent  -- Money exception
+
+                        **Standard Rounding Templates:**
+                            - For averages: ROUND(AVG(column * 1.0), 0)
+                            - For rates: ROUND((numerator * 100.0 / denominator), 0)
+                            - For monetary values: ROUND(SUM(amount), 0)
+                            - For money spent: ROUND(SUM(T1.MonthlyRentUSD), 2)
+                            - For calculations: ROUND((expression * 1.0), 0)
+
+                        **DATA ACCESS RULES:**
+                        1. Don't use any masked columns for sensitive data
+                        2. Key Tables:
+                        - CHKPI_CUSTOMER_DIMENSION: Contains customer information
+                        - CHKPI_RFH_SUPPLIER_MASTER: Contains supplier data
+                        - CHKPI_CorpNameTOMaskName: Mapping table for masked names
+
+                        **MANDATORY EXECUTION STEPS - FOLLOW IN EXACT ORDER:**
+                            1. **Schema Validation**: Cross-reference EVERY table and column name against the YAML schema
+                            2. **Relationship Verification**: Confirm all JOINs use correct foreign key relationships from schema
+                            3. **Column Selection Logic**: Determine if query is about money spent or rental rates
+                            4. **Formula Compliance**: Use ONLY the exact formulas provided below - NO modifications allowed
+                            5. **Alias Enforcement**: Apply MANDATORY aliases as specified below
+                            6. **Syntax Verification**: Ensure T-SQL syntax is 100% correct
+                            7. **Output Validation**: Return ONLY the T-SQL query without explanation
+                        
+                            **STRICT QUERY REQUIREMENTS:**
+                            - NEVER generate queries referencing non-existent tables or columns
+                            - NEVER modify the provided calculation formulas
+                            - NEVER use different table aliases than specified
+                            - NEVER return explanations - ONLY the T-SQL query
+                            - NEVER approximate - use EXACT schema references only
+                        
+                        Also You have access to this Example Queries: {example_prompt_template_cartus}. Please analyze the question carefully relevant to the Schema and give me results accordingly.
+
+                        **SCHEMA COMPLIANCE MANDATE:**
+                            **Ensure T-SQL Query you are generating should be relevant to the YAML file**
+                            **Carefully Check all Column names that are specific to tables and do Joins if required between tables**
+                            **EVERY column reference MUST exist in the schema - NO EXCEPTIONS**
+                            **EVERY table reference MUST exist in the schema - NO EXCEPTIONS**
+                        
+                        **BEDROOM TERMINOLOGY STRICT RULE:**
+                            **If any Questions asked related to Bed Rooms instead of '1 BR', '2 BR', There is no values in the database like 1BR, 2BR. You should return '1 Bedroom' , '2 Bedroom' etc.**
+                            **Example: Select * from dbo.CHKPI_APT_DIMENSION where Bedrooms = '1 Bedroom'**
+                            **NEVER use variations like 'BR', 'bed', 'rm' - ONLY use full 'Bedroom' format**
+
+                        **Ensure T-SQL Query you are generating should be relevant to the YAML file**
+                        **Carefully Check all Column names that are specific to tables and do Joins if required between tables**
+
+                        **MANDATORY CALCULATION FORMULAS - USE EXACTLY AS PROVIDED:**
+                            
+                            AverageNightlyRate:  
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(MonthlyRentUSD * 1.0) / NULLIF(SUM(LenghtOfStay), 0), 0)
+
+                            ALOS(AverageLengthOfStay):
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(TF.LenghtOfStay * 1.0) / NULLIF(COUNT(DISTINCT TF.Cur_Tenancy_Id), 0), 0) 
+
+                            ADR(AverageDailyRate):
+                                Table: CHKPI_TENANCY_FACT 
+                                Formula: ROUND(SUM(TF.MonthlyRentUSD * 1.0) / NULLIF(SUM(TF.LenghtOfStay), 0), 0) 
+
+                            Conversion Rate: 
+                                Table: CHKPI_OPTY_FACT 
+                                Formula: ROUND((SUM(RentedOptyCount * 1.0) / NULLIF(SUM(OptyCount * 1.0), 0)) * 100, 0) 
+
+                            Any Related Question to Suppliers use this convertion rate formula
+                                Table: CHKPI_RFH_SUPPLIER_REQUEST_RESPONSE
+                                Formula: (SUM(X2.BookedCount * 1.0) / COUNT(DISTINCT X2.Opti_Id)) * 100
+
+                        **DO NOT MODIFY THESE FORMULAS UNDER ANY CIRCUMSTANCES**
+
+                        **CRITICAL MONEY SPENT CALCULATION RULES:**
+                            **When queries involve customer spending, money spent, total cost, or financial analysis:**
+
+                            1. **ALWAYS use `MonthlyRentUSD` column from CHKPI_TENANCY_FACT table**
+                            2. **NEVER use `CostToReservationUSD` for money spent calculations**
+                            3. **Formula for Total Money Spent:**
+                            ```sql
+                            ROUND(SUM(T1.MonthlyRentUSD), 2) AS TotalMoneySpent
+                            ```
+
+                            **KEY DISTINCTION:**
+                            - `MonthlyRentUSD` = Total money spent by customer (for spending analysis AND ADR calculations)
+                            - `CostToReservationUSD` = Different cost metric (NOT used for money spent queries)
+
+                            **VALIDATION CHECKPOINT FOR MONEY SPENT QUERIES:**
+                            Before generating any query involving customer costs:
+                            1. ✅ Is this about money spent/customer spending? → Use `MonthlyRentUSD`
+                            2. ✅ Is this about rental rates/ADR? → Use `MonthlyRentUSD`
+                            3. ✅ Are mandatory aliases used? (T1, C1, D1)
+                            4. ✅ Is proper rounding applied? (2 decimal places for money spent)
+                            5. ✅ Is YTD filter applied correctly?
+                            6. ✅ Is TOP clause used for ranking queries?
+
+                            **ZERO TOLERANCE FOR COLUMN CONFUSION:**
+                            - If query involves spending analysis → `MonthlyRentUSD` ONLY
+                            - If query involves rate analysis → `MonthlyRentUSD` ONLY
+                            - Wrong column usage = Immediate failure
+
+                            **CRITICAL TABLE ALIAS GUIDELINES - MANDATORY COMPLIANCE:**
+                            - You may use any meaningful and concise alias for tables.
+                            - Prefer using intuitive short forms that reflect the table name or its role in the query
+                            - Ensure consistency of aliases throughout the query.
+                            - Do not repeat aliases or use ambiguous terms like a, b, c unless absolutely necessary.
+                            - Use distinct aliases for different tables
+                        
+                         **ALIAS VIOLATION = IMMEDIATE FAILURE**
+                            - NEVER DEVIATE FROM THE ALIASES GUIDLINES - this is critical to prevent SQL errors
+                            - NEVER use any real English words or T-SQL reserved keywords as table aliases
+                            - ALWAYS use these specified table aliases for all column references (e.g., C1.CustomerName, T1.CostToReservationUSD)
+
+                            **CRITICAL DATE AND MONTH ORDERING GUIDELINES:**
+                            1. ALWAYS include month/date columns in both SELECT and GROUP BY clauses
+                            2. ALWAYS ensure proper chronological ordering with FORMAT functions
+                            3. For queries spanning multiple years, use proper ORDER BY with date columns
+                            4. NEVER omit date columns from GROUP BY when they appear in SELECT
+                            5. **For YTD queries, always include ORDER BY to show chronological progression**
+                                This addition will guide the SQL agent to generate queries that:
+                                - Comply with SQL Server's GROUP BY requirements
+                                - Ensure proper chronological ordering of results
+                                - Work seamlessly with the visualization pipeline
+
+                            **ABSOLUTE RESTRICTIONS - RETURN 'None' FOR:**
+                            1. Schema-related queries (e.g., "show schema", "table structure", "list columns", "display schema of ...", etc.)
+                            2. User-provided SQL queries for execution
+                            3. Ambiguous requests that cannot be interpreted with 100% certainty
+                            4. Requests referencing non-existent tables or columns
+                            5. Any query that would violate the schema constraints
+
+                            **ZERO TOLERANCE POLICY:**
+                            - If you cannot generate a 100% accurate query based on the schema, return 'None'
+                            - If any table/column reference is uncertain, return 'None'
+                            - If the user request is ambiguous, return 'None'
+                            - If formulas would need modification, return 'None'
+
+                            **FINAL VALIDATION BEFORE OUTPUT:**
+                            Before returning any query, verify:
+                            1. All table names exist in YAML schema
+                            2. All column names exist in their respective tables
+                            3. All aliases follow the mandatory rules
+                            4. All calculations use exact formulas provided
+                            5. All date formatting follows the rules
+                            6. All numeric results are properly rounded
+                            7. **Money spent queries use MonthlyRentUSD with 2 decimal rounding**
+                            8. Query syntax is 100% correct T-SQL
+
+                            **Output format (always return JSON):**
+                            ```json
+                            {{
+                            "action": "Final Answer",
+                            "action_input": "GENERATED_TSQL_QUERY/PREVIOUS_SQL_QUERY/None"
+                            }}
+                            ```
+                            """
+
+
+    human_prompt = """User Input:{input}
+    **INTELLIGENT QUERY ANALYSIS REQUIRED**: 
+    1. First, determine if this is a DUPLICATE, FOLLOW-UP, or NEW question
+    2. If DUPLICATE: Return previous SQL immediately
+    3. If FOLLOW-UP: Generate NEW SQL incorporating the modification/addition
+    4. If NEW: Generate fresh SQL query
+    Previous Query (if any): {agent_scratchpad}
+    """
+
+    # memory = ConversationBufferMemory(return_messages=True)
+    
+    formatted_history = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in get_chat_history(redis_client, session_id)
+    )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history", optional=True),   # enable this
+            ("human", human_prompt),
+        ]
+    ).partial(
+        yaml_output_str=yaml_output_str,
+        example_prompt_template_cartus=example_prompt_template_cartus,
+        history_text=formatted_history,                         # separate name
+    )
+
+    tools = []
+
+    agent = (
+        RunnablePassthrough.assign(
+            agent_scratchpad=lambda x: format_log_to_str(x["intermediate_steps"]),
+            chat_history=lambda x: x.get("chat_history") or (
+                    get_chat_history(redis_client, session_id) if session_id else []
+                    ),
+        )
+        | prompt
+        | llm_instance
+        | JSONAgentOutputParser()
+    )
+
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        handle_parsing_errors=True,
+        verbose=True,
+        # memory=memory,
+    )
+

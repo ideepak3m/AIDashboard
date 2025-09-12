@@ -1,0 +1,115 @@
+tables:
+  customerCompany:
+    columns:
+      - id: INTEGER
+      - name: TEXT
+      - address: TEXT
+      - city: TEXT
+      - state: TEXT
+      - zip_code: TEXT
+      - phone: TEXT
+      - email: TEXT
+      - website: TEXT
+
+  customerContact:
+    columns:
+      - id: INTEGER
+      - company_id: INTEGER
+      - first_name: TEXT
+      - last_name: TEXT
+      - email: TEXT
+      - phone: TEXT
+      - job_title: TEXT
+    foreign_keys:
+      - company_id: customerCompany.id
+
+  supplierCompany:
+    columns:
+      - id: INTEGER
+      - name: TEXT
+      - address: TEXT
+      - city: TEXT
+      - state: TEXT
+      - zip_code: TEXT
+      - phone: TEXT
+      - email: TEXT
+      - website: TEXT
+
+  supplierContact:
+    columns:
+      - id: INTEGER
+      - supplier_id: INTEGER
+      - first_name: TEXT
+      - last_name: TEXT
+      - email: TEXT
+      - phone: TEXT
+      - job_title: TEXT
+    foreign_keys:
+      - supplier_id: supplierCompany.id
+
+  product:
+    columns:
+      - id: INTEGER
+      - brand: TEXT
+      - model: TEXT
+      - category: TEXT
+      - description: TEXT
+      - MSRP: NUMERIC(10,2)
+
+  inventory:
+    columns:
+      - id: INTEGER
+      - product_id: INTEGER
+      - serial_number: TEXT
+      - purchase_date: DATE
+      - purchase_price: NUMERIC(10,2)
+      - condition: TEXT
+      - source: TEXT
+      - price: NUMERIC(10,2)
+      - location: TEXT
+    foreign_keys:
+      - product_id: product.id
+
+  salesOrder:
+    columns:
+      - id: INTEGER
+      - order_number: TEXT
+      - customer_id: INTEGER
+      - order_date: DATE
+      - total_amount: NUMERIC(10,2)
+      - status: TEXT
+    foreign_keys:
+      - customer_id: customerCompany.id
+
+  salesOrderItem:
+    columns:
+      - id: INTEGER
+      - order_id: INTEGER
+      - inventory_id: INTEGER
+      - quantity: INTEGER
+      - unit_price: NUMERIC(10,2)
+    foreign_keys:
+      - order_id: salesOrder.id
+      - inventory_id: inventory.id
+
+  purchaseOrder:
+    columns:
+      - id: INTEGER
+      - order_number: TEXT
+      - supplier_id: INTEGER
+      - order_date: DATE
+      - total_amount: NUMERIC(10,2)
+      - status: TEXT
+    foreign_keys:
+      - supplier_id: supplierCompany.id
+
+  purchaseOrderItem:
+    columns:
+      - id: INTEGER
+      - order_id: INTEGER
+      - product_id: INTEGER
+      - quantity: INTEGER
+      - unit_price: NUMERIC(10,2)
+    foreign_keys:
+      - order_id: purchaseOrder.id
+      - product_id: product.id

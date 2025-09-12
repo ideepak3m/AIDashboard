@@ -4,189 +4,143 @@ import pandas as pd
 import sqlite3
 import plotly.express as px
 import plotly.graph_objects as go
-from kpi_queries import kpi_queries
+from dashboard_queries import sales_manager_map, ceo_map
+
 
 conn = sqlite3.connect('db/company.db')
+report_df = pd.DataFrame()  # Initialize report_df
+
+def get_month_filter(period, quarter=None, half=None):
+    if period == "Quarter":
+        quarter_map = {
+            "Q1": ["01", "02", "03"],
+            "Q2": ["04", "05", "06"],
+            "Q3": ["07", "08", "09"],
+            "Q4": ["10", "11", "12"]
+        }
+        return quarter_map.get(quarter, [])
+    
+    elif period == "Half-Year":
+        half_map = {
+            "H1": ["01", "02", "03", "04", "05", "06"],
+            "H2": ["07", "08", "09", "10", "11", "12"]
+        }
+        return half_map.get(half, [])
+    
+    elif period == "Year":
+        return [f"{i:02}" for i in range(1, 13)]
+
+    return []
+
+
 
 
 st.set_page_config(page_title="Company Dashboard", layout="wide")
 st.title("Company Dashboard")
 
-# Add custom CSS for purple border around KPI cards
-st.markdown(
-    """
-    <style>
-    .kpi-card {
-        border: 2px solid purple;
-        border-radius: 10px;
-        padding: 0;
-        margin-bottom: 0;
-        background: #fff;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-    }
-    .element-container:has(.kpi-card) {
-        padding: 0 !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+# Adding report options
+row1_col1, row1_col2, row1_col3 = st.columns(3)
 
-# KPI cards
-kpi1, kpi2, kpi3 = st.columns(3)
-
-
-with kpi1:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    total_sales = pd.read_sql_query(kpi_queries["total_sales"], conn).iloc[0, 0]
-    st.markdown("### :orange[Total Sales]")
-    st.metric(label="", value=total_sales)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-with kpi2:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    total_revenue = pd.read_sql_query(kpi_queries["total_revenue"], conn).iloc[0, 0]
-    st.markdown("### :orange[Total Revenue]")
-    st.metric(label="", value=f"${total_revenue:,.2f}")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-with kpi3:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    inventory_count = pd.read_sql_query(kpi_queries["inventory_count"], conn).iloc[0, 0]
-    st.markdown("### :orange[Inventory Count]")
-    st.metric(label="", value=inventory_count)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# --- New row: 2 columns for table and chart ---
-st.write("")
-row1_col1, row1_col2 = st.columns(2)
-
-# Top 10 customers by value and machines bought in the current year
-import datetime
-current_year = datetime.date.today().year
-sales_by_customer_year_query = f'''
-    SELECT c.name AS Name,
-           COUNT(soi.id) AS Units_Purchased,
-           ROUND(SUM(so.total_amount), 2) AS Value
-    FROM salesOrder so
-    JOIN customerCompany c ON so.customer_id = c.id
-    JOIN salesOrderItem soi ON soi.order_id = so.id
-    WHERE strftime('%Y', so.order_date) = '{current_year}'
-    GROUP BY c.id, c.name
-    ORDER BY Value DESC
-    LIMIT 10;
-'''
-top_customers = pd.read_sql_query(sales_by_customer_year_query, conn)
-
-# Format currency for display
-top_customers["Value"] = top_customers["Value"].apply(lambda x: f"${x:,.2f}")
-    
-# --- Row 1: Table and Chart ---
 with row1_col1:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown(f"### :orange[Top 10 Customers ({current_year})]")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    fig_table = go.Figure(data=[go.Table(
-        header=dict(
-            values=["Customer", "Units Purchased", "Total Value (CAD)"],
-            fill_color='#333333',  # dark header
-            font=dict(color='white', size=14),
-            align='left',
-            line_color='black'
-        ),
-        cells=dict(
-            values=[top_customers[col] for col in top_customers.columns],
-            fill_color=[['#1e1e1e', '#2a2a2a'] * (len(top_customers) // 2)],  # alternating dark rows
-            font=dict(color='white', size=11),
-            align='left',
-            line_color='black'
-        )
-    )])
-    st.markdown(f""" <div style="padding-right:20px;"> """, unsafe_allow_html=True)
-    st.plotly_chart(fig_table, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    period = st.radio("Period", ["Quarter", "Half-Year", "Year"], horizontal=True)
 
 with row1_col2:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown(f"### :blue[Customer Value Breakdown ({current_year})]")
-    st.markdown('</div>', unsafe_allow_html=True)
+    quarter = None
+    half = None
+    if period == "Quarter":
+        quarter = st.selectbox("Quarter", ["Q1", "Q2", "Q3", "Q4"])
+    elif period == "Half-Year":
+        half = st.selectbox("Half Year", ["H1", "H2"])
+        
+with row1_col3:
+    year = st.selectbox("Year", list(range(2020, 2026)))
 
-    fig_bar = px.bar(
-        top_customers,
-        x="Name",
-        y="Value",
-        title="Top Customers by Purchase Value",
-        labels={"Value": "Total Value", "Name": "Customer"},
-        text="Value",
-        color="Name"
-    )
-    fig_bar.update_traces(texttemplate='%{text}', textposition='outside')
-    fig_bar.update_layout(xaxis_tickangle=-45, showlegend=False)
+row2_col1, row2_col2, row2_col3 = st.columns(3)
 
-    st.plotly_chart(fig_bar, use_container_width=True)
     
-# --- Row 2: Inventory by Brand/Model ---
-inventory_by_brand_model_query = '''
-    SELECT p.brand, p.model, COUNT(i.id) AS inventory_count
-    FROM inventory i
-    JOIN product p ON i.product_id = p.id
-    GROUP BY p.brand, p.model
-    ORDER BY p.brand, p.model;
-'''
-
-inventory_df = pd.read_sql_query(inventory_by_brand_model_query, conn)
-
-row2_col1, row2_col2 = st.columns(2)
-
-# --- Column 1: Bar Chart ---
 with row2_col1:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown(f"### :orange[Inventory by Brand/Model]")
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    fig_table = go.Figure(data=[go.Table(
-        header=dict(
-            values=["Brand", "Model", "Inventory"],
-            fill_color='#333333',
-            font=dict(color='white', size=14),
-            align='left'
-        ),
-        cells=dict(
-            values=[inventory_df[col] for col in inventory_df.columns],
-            fill_color=[['#1e1e1e', '#2a2a2a'] * (len(inventory_df) // 2)],
-            font=dict(color='white', size=11),
-            align='left'
-        )
-    )])
-    st.markdown(f""" <div style="padding-right:20px;"> """, unsafe_allow_html=True)
-    st.plotly_chart(fig_table, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    role = st.selectbox("Select Role", ["CEO", "Sales Manager"])
 
-
-
-# --- Column 2: Styled Table ---
 with row2_col2:
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown("### :blue[Inventory by Brand/Model]")
-    st.markdown('</div>', unsafe_allow_html=True)
+    report_options = {
+    "Sales Manager": list(sales_manager_map.keys()),
+    "CEO": list(ceo_map.keys())
+    }
+    report_type = st.selectbox("Select Report", report_options[role])
 
-    fig_inventory = px.bar(
-        inventory_df,
-        x="model",
-        y="inventory_count",
-        color="brand",
-        text="inventory_count",
-        title="Inventory Distribution",
-        labels={"inventory_count": "Units", "model": "Model"},
-    )
-    fig_inventory.update_traces(textposition='outside')
-    fig_inventory.update_layout(xaxis_tickangle=-45, showlegend=True)
 
-    st.plotly_chart(fig_inventory, use_container_width=True)
+with row2_col3:
+    if "report_df" not in st.session_state:
+        st.session_state.report_df = pd.DataFrame()
+    if st.button("Generate Report"):
+        months = get_month_filter(period, quarter, half)
+        month_filter = ",".join(f"'{m}'" for m in months)
+
+        query_template = sales_manager_map[report_type] if role == "Sales Manager" else ceo_map[report_type]
+        query = query_template.format(year=year, month_filter=month_filter)
+        
+
+        report_df = pd.read_sql_query(query, conn)
+        # Identify financial columns
+        financial_cols = ["total_sales", "revenue", "total_spent", "lifetime_value", "gross_profit", "profit", "cost"]
+
+        # Format them as currency
+        for col in financial_cols:
+            if col in report_df.columns:
+                report_df[col] = report_df[col].apply(lambda x: f"${x:,.2f}")
+        report_df = report_df.reset_index(drop=True)
+        report_df.index += 1      
+        st.session_state.report_df = report_df
     
+report_df = st.session_state.report_df   
+# Layout for table and chart
+if not report_df.empty:
+    table_col, chart_col = st.columns([2, 3])
+
+    with table_col:
+        st.subheader("Report Table")
+        # Replace this with your actual DataFrame
+        st.dataframe(report_df)
+
+    with chart_col:
+        st.subheader("Report Chart")
+        chart_type = st.selectbox("Chart Type", ["Bar", "Line", "Pie"], key="chart_type")
+
+        if len(report_df.columns) >= 2:
+            label = report_df.columns[0]
+            value = report_df.columns[1]
+
+            if chart_type == "Bar":
+                fig = px.bar(report_df, x=label, y=value, text=value, color=value, color_continuous_scale="Plasma")
+                fig.update_traces(texttemplate='%{text:.2s}', textposition='outside')
+                fig.update_layout(
+                    title="Bar Chart",
+                    xaxis_title=label,
+                    yaxis_title=value,
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            elif chart_type == "Line":
+                fig = px.line(report_df, x=label, y=value, markers=True)
+                fig.update_layout(
+                    title="Line Chart",
+                    xaxis_title=label,
+                    yaxis_title=value,
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            elif chart_type == "Pie":
+                fig = px.pie(report_df, names=label, values=value)
+                fig.update_layout(
+                    title="Pie Chart",
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.warning("Not enough data to generate chart.")
+
+else:
+    st.info("Please select report parameters and click 'Generate Report' to view the report.")
