@@ -9,8 +9,15 @@ import json
 import pprint
 
 # --- Load API Key ---
-load_dotenv()
-API_KEY = os.getenv("GPT5NANO_API_KEY")
+if "GPT5NANO_API_KEY" in st.secrets:
+    API_KEY = st.secrets["GPT5NANO_API_KEY"]
+else:
+    load_dotenv()
+    API_KEY = os.getenv("GPT5NANO_API_KEY")
+
+if not API_KEY:
+    st.error("❌ No API key found. Please set GPT5NANO_API_KEY in Streamlit secrets or .env file.")
+    st.stop()
 
 # --- Database Connection ---
 conn = sqlite3.connect('db/company.db')
