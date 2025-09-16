@@ -44,7 +44,7 @@ with title_col:
 
 with button_col:
     st.markdown("""
-        <a href="https://adt-aidashboard.streamlit.app/ai" target="_blank">
+        <a href="https://adt-aidashboard.streamlit.app/ai_engine" target="_blank">
             <button style='font-size:16px;padding:8px 16px;border-radius:6px;background-color:#4CAF50;color:white;border:none;margin-top:20px;'>
                 🚀 AI Assistant
             </button>
