@@ -36,7 +36,20 @@ def get_month_filter(period, quarter=None, half=None):
 
 
 st.set_page_config(page_title="Company Dashboard", layout="wide")
-st.title("Company Dashboard")
+# Create two columns: one for the title, one for the button
+title_col, button_col = st.columns([6, 1])  # Adjust ratio as needed
+
+with title_col:
+    st.title("Company Dashboard")
+
+with button_col:
+    st.markdown("""
+        <a href="https://adt-aidashboard.streamlit.app/ai" target="_blank">
+            <button style='font-size:16px;padding:8px 16px;border-radius:6px;background-color:#4CAF50;color:white;border:none;margin-top:20px;'>
+                🚀 AI Assistant
+            </button>
+        </a>
+    """, unsafe_allow_html=True)
 
 # Adding report options
 row1_col1, row1_col2, row1_col3 = st.columns(3)
