@@ -7,13 +7,19 @@ import plotly.express as px
 import sqlite3
 import json
 import pprint
+from streamlit.runtime.secrets import StreamlitSecretNotFoundError
 
 # --- Load API Key ---
-if "GPT5NANO_API_KEY" in st.secrets:
+try:
     API_KEY = st.secrets["GPT5NANO_API_KEY"]
-else:
+except StreamlitSecretNotFoundError:
     load_dotenv()
     API_KEY = os.getenv("GPT5NANO_API_KEY")
+# if "GPT5NANO_API_KEY" in st.secrets:
+#     API_KEY = st.secrets["GPT5NANO_API_KEY"]
+# else:
+#     load_dotenv()
+#     API_KEY = os.getenv("GPT5NANO_API_KEY")
 
 if not API_KEY:
     st.error("❌ No API key found. Please set GPT5NANO_API_KEY in Streamlit secrets or .env file.")
@@ -35,11 +41,19 @@ client = OpenAI(api_key=API_KEY)
 # --- Streamlit Layout ---
 st.set_page_config(page_title="AI Assistant", layout="wide")
 
+DEFAULT_USER_QUERY = "Who are the top 5 customers by total sales amount in 2024?"
+#Initializing session state variables
+if "user_input" not in st.session_state:
+    st.session_state.user_input = DEFAULT_USER_QUERY
+    st.session_state.cleared = False
+    
+    
+
 with st.sidebar:
     st.header("🤖 AI Chatbot")
     user_input = st.text_area("Ask a business query:", height=200)
     submit = st.button("Generate")
-    debug_mode = st.checkbox("🔧 Use Debug Mode (skip LLM)", value=False)
+    debug_mode = st.checkbox("🔧 Use Debug Mode (skip LLM)", value=True)
 
 st.title("AI Insights Dashboard")
 
@@ -49,7 +63,10 @@ def run_query(sql_query: str):
     return pd.read_sql_query(sql_query, conn)
 
 # --- MAIN EXECUTION ---
-if submit and user_input:
+if submit:
+    # If user_input is empty, use the default
+    if not user_input.strip():
+        user_input = DEFAULT_USER_QUERY
     if debug_mode:
         # Debug mode: predefined SQL + summary
         sql_query = """
@@ -63,6 +80,7 @@ if submit and user_input:
         LIMIT 5;
         """
         summary = "Ferguson, Short and Lambert (BC) is the top customer in 2024..."
+        st.write("⚙️ **Debug Mode**: Using predefined SQL and summary.")
         financial_columns = []
     else:
         # --- Step 1: SQL Generation Prompt ---
